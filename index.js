@@ -1,320 +1,396 @@
 require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
-const axios = require("axios");
 const { setIntervalAsync } = require("set-interval-async");
 const { DateTime } = require("luxon");
+const web3 = require("@solana/web3.js");
+const { PublicKey } = require("@solana/web3.js"); // Import PublicKey for better clarity
+const { TOKEN_PROGRAM_ID } = require("@solana/spl-token");
 
 // Telegram Bot Configuration
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+if (!TELEGRAM_BOT_TOKEN) {
+  throw new Error("TELEGRAM_BOT_TOKEN is required in .env file");
+}
+
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
 // Configuration
 const CONFIG = {
-  trackedWallets: [
-    "5GbECLdJkC9MQwEvPjeT8qPKt7VbWeyWqPLw2BtqVMR",
-    "5gn3uxhsZ7TtLDZwxKXPJuUTB9dEMgnb3oFJ6rKDjoX4",
-    "CRVidEDtEUTYZisCxBZkpELzhQc9eauMLR3FWg74tReL",
-    "GpaxwRPnFsygJaw1d9uf78Tzt7yDoZr5hBhfWEk7gyRT",
+  trackedWallets: [], // Removed tracked wallets
+  knownDexPrograms: [
+    "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin", // Raydium
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", // Orca
+    "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB", // Jupiter
   ],
-  requestLimit: 5,
-  minAlertAmount: 1000, // Minimum amount for "Alpha Alert" in SOL
-  updateInterval: 30000, // Update interval in milliseconds
-  cacheExpiry: 3600000, // Cache expiry time in milliseconds (1 hour)
+  rpcEndpoints: ["https://api.mainnet-beta.solana.com"],
+  rateLimit: {
+    requestsPerSecond: 5,
+    timeWindow: 1000,
+  },
+  updateInterval: 120000, // 2 minutes
+  cacheExpiry: 3600000, // 1 hour
+  maxRetries: 3,
+  batchSize: 2,
+  minTokenAmount: 100, // Minimum token amount to trigger alert
 };
 
-// Transaction class with improved structure
-class Transaction {
-  constructor(data) {
-    this.wallet = data.wallet;
-    this.signature = data.signature;
-    this.type = data.type;
-    this.timestamp = data.timestamp;
-    this.status = data.status;
-    this.amount = data.amount;
-    this.sender = data.sender;
-    this.receiver = data.receiver;
-    this.createdAt = Date.now(); // For cache management
-  }
-
-  isExpired() {
-    return Date.now() - this.createdAt > CONFIG.cacheExpiry;
-  }
-}
-
+// Rate Limiter Class
 class RateLimiter {
-  constructor(limit, interval) {
-    this.limit = limit;
-    this.interval = interval;
-    this.requests = [];
+  constructor(requestsPerSecond, timeWindow) {
+    this.tokens = requestsPerSecond;
+    this.maxTokens = requestsPerSecond;
+    this.timeWindow = timeWindow;
+    this.lastRefill = Date.now();
   }
-  async throttle() {
-    const now = Date.now();
-    this.requests = this.requests.filter((time) => now - time < this.interval);
 
-    if (this.requests.length >= this.limit) {
-      const oldestRequest = this.requests[0];
-      const waitTime = this.interval - (now - oldestRequest);
-      await new Promise((resolve) => setTimeout(resolve, waitTime));
+  async getToken() {
+    const now = Date.now();
+    const timePassed = now - this.lastRefill;
+
+    // Refill tokens based on time passed
+    if (timePassed > this.timeWindow) {
+      this.tokens = this.maxTokens;
+      this.lastRefill = now;
     }
 
-    this.requests.push(now);
+    if (this.tokens <= 0) {
+      const waitTime = this.timeWindow - (now - this.lastRefill);
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.max(0, waitTime))
+      );
+      return this.getToken();
+    }
+
+    this.tokens--;
+    return true;
   }
 }
 
-// Solana Whale Tracker with improved error handling and API alternatives
-class SolanaWhaleTracker {
+// Transaction Cache Class
+class TransactionCache {
+  constructor(expiryTime) {
+    this.cache = new Map();
+    this.expiryTime = expiryTime;
+  }
+
+  set(key, value) {
+    this.cache.set(key, {
+      data: value,
+      timestamp: Date.now(),
+    });
+  }
+
+  get(key) {
+    const item = this.cache.get(key);
+    if (!item) return null;
+
+    if (Date.now() - item.timestamp > this.expiryTime) {
+      this.cache.delete(key);
+      return null;
+    }
+
+    return item.data;
+  }
+
+  clean() {
+    const now = Date.now();
+    for (const [key, value] of this.cache.entries()) {
+      if (now - value.timestamp > this.expiryTime) {
+        this.cache.delete(key);
+      }
+    }
+  }
+
+  size() {
+    return this.cache.size;
+  }
+}
+
+// Main Tracker Class
+class SolanaTokenTracker {
   constructor() {
     this.subscribers = new Set();
-    this.txCache = new Map(); // Changed to Map for better cache management
-    this.rateLimiter = new RateLimiter(30, 60000); // 30 requests per minute
-
-    this.apiEndpoints = {
-      helius: {
-        url: `https://api.helius.xyz/v0/addresses/{wallet}/transactions`,
-        params: { "api-key": process.env.HELIUS_API_KEY },
-      },
-      solscan: {
-        url: "https://public-api.solscan.io/transaction/last",
-        params: { limit: 50 },
-      },
-      solanafm: {
-        url: "https://api.solana.fm/v0/transactions/search",
-        method: "POST",
-      },
-    };
-  }
-
-  // Clean expired transactions from cache
-  cleanCache() {
-    for (const [signature, tx] of this.txCache.entries()) {
-      if (tx.isExpired()) {
-        this.txCache.delete(signature);
-      }
-    }
-  }
-
-  async fetchHeliusTransactions(walletAddress) {
-    await this.rateLimiter.throttle();
-    const url = this.apiEndpoints.helius.url.replace("{wallet}", walletAddress);
-    try {
-      const response = await axios.get(url, {
-        params: this.apiEndpoints.helius.params,
-        timeout: 5000,
-      });
-      return response.data.map((tx) =>
-        this.parseHeliusTransaction(tx, walletAddress)
-      );
-    } catch (error) {
-      if (error.response?.status === 429) {
-        // Wait longer on rate limit
-        await new Promise((resolve) => setTimeout(resolve, 10000));
-      }
-      throw error;
-    }
-  }
-
-  async fetchSolscanTransactions(walletAddress) {
-    await this.rateLimiter.throttle();
-    try {
-      const response = await axios.get(this.apiEndpoints.solscan.url, {
-        params: {
-          ...this.apiEndpoints.solscan.params,
-          account: walletAddress,
-        },
-        headers: {
-          accept: "application/json",
-        },
-        timeout: 5000,
-      });
-      return response.data.map((tx) =>
-        this.parseSolscanTransaction(tx, walletAddress)
-      );
-    } catch (error) {
-      if (error.response?.status === 404) {
-        // Log specific error for debugging
-        console.warn(`Solscan API returned 404 for wallet: ${walletAddress}`);
-      }
-      throw error;
-    }
-  }
-
-  async fetchSolanaFMTransactions(walletAddress) {
-    await this.rateLimiter.throttle();
-    try {
-      const response = await axios({
-        method: this.apiEndpoints.solanafm.method,
-        url: this.apiEndpoints.solanafm.url,
-        data: {
-          address: walletAddress,
-          limit: 50,
-        },
-        headers: {
-          "Content-Type": "application/json",
-        },
-        timeout: 5000,
-      });
-      return response.data.map((tx) =>
-        this.parseSolanaFMTransaction(tx, walletAddress)
-      );
-    } catch (error) {
-      if (error.response?.status === 405) {
-        console.warn(
-          "SolanaFM API method not allowed, check API documentation for updates"
-        );
-      }
-      throw error;
-    }
-  }
-
-  async getWalletTransactions(walletAddress) {
-    let errors = [];
-    const attempts = [
-      { name: "Helius", fn: this.fetchHeliusTransactions },
-      { name: "Solscan", fn: this.fetchSolscanTransactions },
-      { name: "SolanaFM", fn: this.fetchSolanaFMTransactions },
-    ];
-
-    for (const { name, fn } of attempts) {
-      try {
-        const transactions = await fn.call(this, walletAddress);
-        if (transactions && transactions.length > 0) {
-          return transactions.filter(
-            (tx) => tx && !this.txCache.has(tx.signature)
-          );
-        }
-      } catch (error) {
-        errors.push(`${name}: ${error.message}`);
-        continue;
-      }
-    }
-
-    if (errors.length === attempts.length) {
-      console.error("All API attempts failed:", errors.join(", "));
-    }
-    return [];
-  }
-
-  parseHeliusTransaction(tx, walletAddress) {
-    return new Transaction({
-      wallet: walletAddress,
-      signature: tx.signature,
-      type: tx.type,
-      timestamp: DateTime.fromMillis(tx.timestamp).toFormat(
-        "yyyy-MM-dd HH:mm:ss"
-      ),
-      status: tx.status,
-      amount: tx.amount ? parseFloat(tx.amount) : null,
-      sender: tx.sourceAddress,
-      receiver: tx.destinationAddress,
-    });
-  }
-
-  parseSolscanTransaction(tx, walletAddress) {
-    return new Transaction({
-      wallet: walletAddress,
-      signature: tx.txHash,
-      type: tx.txType,
-      timestamp: DateTime.fromMillis(tx.blockTime * 1000).toFormat(
-        "yyyy-MM-dd HH:mm:ss"
-      ),
-      status: tx.status,
-      amount: tx.lamport ? tx.lamport / 1e9 : null, // Convert lamports to SOL
-      sender: tx.src,
-      receiver: tx.dst,
-    });
-  }
-
-  parseSolanaFMTransaction(tx, walletAddress) {
-    return new Transaction({
-      wallet: walletAddress,
-      signature: tx.signatures[0],
-      type: this.determineTransactionType(tx),
-      timestamp: DateTime.fromISO(tx.blockTime).toFormat("yyyy-MM-dd HH:mm:ss"),
-      status: tx.success ? "confirmed" : "failed",
-      amount: this.extractSolanaFMAmount(tx),
-      sender: tx.from,
-      receiver: tx.to,
-    });
-  }
-
-  determineTransactionType(tx) {
-    // Add logic to determine transaction type based on instruction data
-    if (tx.instructions?.some((inst) => inst.program === "system")) {
-      return "SOL_TRANSFER";
-    }
-    return "UNKNOWN";
-  }
-
-  extractSolanaFMAmount(tx) {
-    // Add logic to extract amount from SolanaFM transaction format
-    const transferInst = tx.instructions?.find(
-      (inst) => inst.program === "system" && inst.type === "transfer"
+    this.txCache = new TransactionCache(CONFIG.cacheExpiry);
+    this.rateLimiter = new RateLimiter(
+      CONFIG.rateLimit.requestsPerSecond,
+      CONFIG.rateLimit.timeWindow
     );
-    return transferInst ? parseFloat(transferInst.amount) / 1e9 : null;
+    this.currentRpcIndex = 0;
+    this.initializeConnection();
   }
 
-  formatWalletAlert(transactions) {
-    if (transactions.length === 0) {
-      return "🔍 No new transactions detected.";
+  initializeConnection() {
+    this.connection = new web3.Connection(
+      CONFIG.rpcEndpoints[this.currentRpcIndex],
+      {
+        commitment: "confirmed",
+        confirmTransactionInitialTimeout: 60000,
+        wsEndpoint: undefined,
+      }
+    );
+    console.log(
+      `Connected to RPC: ${CONFIG.rpcEndpoints[this.currentRpcIndex]}`
+    );
+  }
+
+  rotateRpcEndpoint() {
+    this.currentRpcIndex =
+      (this.currentRpcIndex + 1) % CONFIG.rpcEndpoints.length;
+    this.initializeConnection();
+  }
+
+  async retryOperation(operation, context = "") {
+    let lastError;
+
+    for (let attempt = 1; attempt <= CONFIG.maxRetries; attempt++) {
+      try {
+        await this.rateLimiter.getToken();
+        return await operation();
+      } catch (error) {
+        lastError = error;
+        const isRateLimit =
+          error.message.includes("429") ||
+          error.message.includes("Too many requests");
+
+        if (isRateLimit) {
+          const delay = Math.min(1000 * Math.pow(2, attempt), 8000);
+          console.log(
+            `Rate limited ${context}. Retrying after ${delay}ms (${attempt}/${CONFIG.maxRetries})`
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          this.rotateRpcEndpoint();
+        } else if (!error.message.includes("fetch failed")) {
+          throw error;
+        }
+      }
     }
 
-    let alertMessage = "🚨 *Wallet Transaction Update* 🚨\n\n";
+    throw lastError;
+  }
+
+  async parseTokenTransfer(tx, meta) {
+    async function fetchMemeCoins() {
+      try {
+        const response = await fetch("https://api.example.com/memecoins"); // Replace with actual API URL
+        if (!response.ok) {
+          throw new Error("Network response was not ok");
+        }
+        return await response.json();
+      } catch (error) {
+        console.error("Error fetching meme coins:", error);
+        return {};
+      }
+    }
+    try {
+      if (
+        !tx?.transaction?.message ||
+        !meta?.postTokenBalances ||
+        !meta?.preTokenBalances
+      ) {
+        return null;
+      }
+
+      const accountKeys = tx.transaction.message.accountKeys.map((key) =>
+        typeof key === "string" ? key : key.toBase58()
+      );
+
+      const isDexTransaction = accountKeys.some((key) =>
+        CONFIG.knownDexPrograms.includes(key)
+      );
+
+      if (!isDexTransaction) return null;
+
+      const tokenTransfers = [];
+
+      for (const postBalance of meta.postTokenBalances) {
+        const preBalance = meta.preTokenBalances.find(
+          (pre) => pre.accountIndex === postBalance.accountIndex
+        );
+
+        if (!preBalance || !postBalance?.uiTokenAmount?.amount) continue;
+
+        const balanceChange =
+          Number(postBalance.uiTokenAmount.amount) -
+          Number(preBalance.uiTokenAmount.amount);
+
+        if (balanceChange > CONFIG.minTokenAmount) {
+          tokenTransfers.push({
+            mint: postBalance.mint,
+            amount:
+              balanceChange /
+              Math.pow(10, postBalance.uiTokenAmount.decimals || 0),
+            receiver: accountKeys[postBalance.accountIndex],
+            decimals: postBalance.uiTokenAmount.decimals || 0,
+          });
+        }
+      }
+
+      return tokenTransfers.length > 0 ? tokenTransfers : null;
+    } catch (error) {
+      console.error("Error parsing token transfer:", error);
+      return null;
+    }
+  }
+
+  identifyDex(tx) {
+    try {
+      const programIds = tx.transaction.message.accountKeys.map((key) =>
+        typeof key === "string" ? key : key.toBase58()
+      );
+
+      if (programIds.includes(CONFIG.knownDexPrograms[0])) return "Raydium";
+      if (programIds.includes(CONFIG.knownDexPrograms[1])) return "Orca";
+      if (programIds.includes(CONFIG.knownDexPrograms[2])) return "Jupiter";
+      return "Unknown DEX";
+    } catch (error) {
+      console.error("Error identifying DEX:", error);
+      return "Unknown DEX";
+    }
+  }
+
+  async getWalletTransactions() {
+    const walletAddress =
+      CONFIG.trackedWallets[
+        Math.floor(Math.random() * CONFIG.trackedWallets.length)
+      ]; // Select a random wallet address
+    try {
+      const publicKey = new web3.PublicKey(walletAddress);
+
+      const signatures = await this.retryOperation(
+        async () =>
+          this.connection.getSignaturesForAddress(
+            publicKey,
+            { limit: 5 },
+            "confirmed"
+          ),
+        `getting signatures for ${walletAddress}`
+      );
+
+      const newSignatures = signatures.filter(
+        (sig) => !this.txCache.get(sig.signature)
+      );
+
+      if (newSignatures.length === 0) return [];
+
+      const allTransactions = [];
+
+      for (let i = 0; i < newSignatures.length; i += CONFIG.batchSize) {
+        const batch = newSignatures.slice(i, i + CONFIG.batchSize);
+
+        const batchTransactions = await Promise.all(
+          batch.map(async (sig) => {
+            try {
+              const tx = await this.retryOperation(
+                async () =>
+                  this.connection.getTransaction(sig.signature, {
+                    maxSupportedTransactionVersion: 0,
+                  }),
+                `getting transaction ${sig.signature}`
+              );
+
+              if (!tx) return null;
+
+              const tokenTransfers = await this.parseTokenTransfer(tx, tx.meta);
+              if (!tokenTransfers) return null;
+
+              return tokenTransfers.map((transfer) => ({
+                wallet: walletAddress,
+                signature: sig.signature,
+                type: "TOKEN_PURCHASE",
+                timestamp: tx.blockTime
+                  ? DateTime.fromSeconds(tx.blockTime).toFormat(
+                      "yyyy-MM-dd HH:mm:ss"
+                    )
+                  : DateTime.now().toFormat("yyyy-MM-dd HH:mm:ss"),
+                status: "confirmed",
+                amount: transfer.amount,
+                receiver: transfer.receiver,
+                tokenMint: transfer.mint,
+                dex: this.identifyDex(tx),
+                createdAt: Date.now(),
+              }));
+            } catch (error) {
+              console.error(
+                `Error processing transaction ${sig.signature}:`,
+                error
+              );
+              return null;
+            }
+          })
+        );
+
+        allTransactions.push(
+          ...batchTransactions.filter((tx) => tx !== null).flat()
+        );
+
+        // Add delay between batches
+        if (i + CONFIG.batchSize < newSignatures.length) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
+
+      // Cache new transactions
+      allTransactions.forEach((tx) => {
+        this.txCache.set(tx.signature, tx);
+      });
+
+      return allTransactions;
+    } catch (error) {
+      console.error(`Error fetching transactions for ${walletAddress}:`, error);
+      return [];
+    }
+  }
+
+  formatAlert(transactions) {
+    if (transactions.length === 0) {
+      return "🔍 No new token purchases detected.";
+    }
+
+    let message = "🚨 *New Token Purchases Detected* 🚨\n\n";
+
     transactions.forEach((tx) => {
       const walletShort = `${tx.wallet.slice(0, 6)}...${tx.wallet.slice(-4)}`;
-      alertMessage += `*Wallet:* \`${walletShort}\`\n`;
-      alertMessage += `*Type:* ${tx.type}\n`;
-      alertMessage += `*Time:* ${tx.timestamp}\n`;
+      const tokenShort = `${tx.tokenMint.slice(0, 6)}...${tx.tokenMint.slice(
+        -4
+      )}`;
 
-      if (tx.amount !== null) {
-        const alertLevel =
-          tx.amount > CONFIG.minAlertAmount
-            ? "🔴 Alpha Alert"
-            : "🟢 Normal Alert";
-        const senderShort = `${tx.sender.slice(0, 6)}...${tx.sender.slice(-4)}`;
-        const receiverShort = `${tx.receiver.slice(0, 6)}...${tx.receiver.slice(
-          -4
-        )}`;
-
-        alertMessage += `${alertLevel}\n`;
-        alertMessage += `💰 *Transfer Details:*\n`;
-        alertMessage += `From: \`${senderShort}\`\n`;
-        alertMessage += `To: \`${receiverShort}\`\n`;
-        alertMessage += `Amount: ${tx.amount.toFixed(2)} SOL\n`;
-      }
-
-      alertMessage += `[View Transaction](https://solscan.io/tx/${tx.signature})\n`;
-      alertMessage += "➖➖➖➖➖➖➖➖➖➖\n";
+      message += `*Wallet:* \`${walletShort}\`\n`;
+      message += `*DEX:* ${tx.dex}\n`;
+      message += `*Time:* ${tx.timestamp}\n`;
+      message += `*Token:* \`${tokenShort}\`\n`;
+      message += `*Amount:* ${tx.amount.toLocaleString()} tokens\n`;
+      message += `[View Transaction](https://solscan.io/tx/${tx.signature})\n`;
+      message += `[View Token](https://solscan.io/token/${tx.tokenMint})\n`;
+      message += "➖➖➖➖➖➖➖➖➖➖\n";
     });
 
-    return alertMessage;
+    return message;
   }
 
-  async sendWalletAlerts() {
+  async start() {
+    console.log("🚀 Starting Solana Token Tracker...");
+
     await setIntervalAsync(async () => {
       try {
-        this.cleanCache(); // Clean expired transactions
-        const transactions = await this.fetchAllTransactions();
+        this.txCache.clean();
+
+        const transactions = [];
+        for (const wallet of CONFIG.trackedWallets) {
+          const walletTxs = await this.getWalletTransactions(wallet);
+          transactions.push(...walletTxs);
+        }
 
         if (transactions.length > 0) {
-          const alertMessage = this.formatWalletAlert(transactions);
+          const message = this.formatAlert(transactions);
 
-          // Store new transactions in cache
-          transactions.forEach((tx) => {
-            this.txCache.set(tx.signature, tx);
-          });
-
-          // Send alerts to all subscribers
           const sendPromises = Array.from(this.subscribers).map((chatId) =>
             bot
-              .sendMessage(chatId, alertMessage, {
+              .sendMessage(chatId, message, {
                 parse_mode: "Markdown",
                 disable_web_page_preview: true,
               })
               .catch((err) => {
-                console.error(
-                  `Failed to send message to ${chatId}:`,
-                  err.message
-                );
+                console.error(`Failed to send message to ${chatId}:`, err);
                 if (err.response?.statusCode === 403) {
                   this.subscribers.delete(chatId);
                 }
@@ -324,34 +400,42 @@ class SolanaWhaleTracker {
           await Promise.all(sendPromises);
         }
       } catch (error) {
-        console.error("Error in sendWalletAlerts:", error);
+        console.error("Error in tracker loop:", error);
       }
     }, CONFIG.updateInterval);
   }
 
-  async fetchAllTransactions() {
-    const tasks = CONFIG.trackedWallets.map((wallet) =>
-      this.getWalletTransactions(wallet)
-    );
-    const results = await Promise.allSettled(tasks);
-    return results
-      .filter((result) => result.status === "fulfilled")
-      .map((result) => result.value)
-      .flat();
+  addSubscriber(chatId) {
+    this.subscribers.add(chatId);
+  }
+
+  removeSubscriber(chatId) {
+    return this.subscribers.delete(chatId);
+  }
+
+  getStatus() {
+    return {
+      activeSubscribers: this.subscribers.size,
+      trackedWallets: CONFIG.trackedWallets.length,
+      cachedTransactions: this.txCache.size(),
+      updateInterval: CONFIG.updateInterval / 1000,
+      currentRpc: CONFIG.rpcEndpoints[this.currentRpcIndex],
+    };
   }
 }
 
-// Telegram Bot Handlers
-const solanaTracker = new SolanaWhaleTracker();
+// Initialize tracker
+const tokenTracker = new SolanaTokenTracker();
 
+// Bot Commands
 bot.onText(/\/start/, (msg) => {
-  solanaTracker.subscribers.add(msg.chat.id);
+  tokenTracker.addSubscriber(msg.chat.id);
   const welcomeText = `
-🎉 *Welcome to Solana Whale Tracker* 🎉
+🎉 *Welcome to Solana Token Tracker* 🎉
 
 You will receive transaction updates every ${
     CONFIG.updateInterval / 1000
-  } seconds!
+  } seconds.
 
 Available commands:
 /stop - Stop receiving alerts
@@ -362,41 +446,43 @@ Happy tracking! 🐋
 `;
   bot.sendMessage(msg.chat.id, welcomeText, { parse_mode: "Markdown" });
 });
-
 bot.onText(/\/stop/, (msg) => {
-  const wasSubscribed = solanaTracker.subscribers.delete(msg.chat.id);
+  const wasSubscribed = tokenTracker.removeSubscriber(msg.chat.id);
   const message = wasSubscribed
-    ? "✅ You have unsubscribed from alerts."
-    : "❌ You are not subscribed to alerts.";
+    ? "✅ You have unsubscribed from token alerts."
+    : "❌ You were not subscribed to alerts.";
+
   bot.sendMessage(msg.chat.id, message);
 });
 
 bot.onText(/\/status/, (msg) => {
-  const statusText = `
-📊 *Bot Status*
-Active Subscribers: ${solanaTracker.subscribers.size}
-Tracked Wallets: ${CONFIG.trackedWallets.length}
-Cached Transactions: ${solanaTracker.txCache.size}
-Update Interval: ${CONFIG.updateInterval / 1000}s
-Minimum Alert Amount: ${CONFIG.minAlertAmount} SOL
-`;
-  bot.sendMessage(msg.chat.id, statusText, { parse_mode: "Markdown" });
+  const status = tokenTracker.getStatus();
+  const statusMessage = `
+📊 *Bot Status* 📊
+
+• Active Subscribers: ${status.activeSubscribers}
+• Tracked Wallets: ${status.trackedWallets}
+• Cached Transactions: ${status.cachedTransactions}
+• Update Interval: ${status.updateInterval} seconds
+• Current RPC: ${status.currentRpc}
+  `;
+
+  bot.sendMessage(msg.chat.id, statusMessage, { parse_mode: "Markdown" });
 });
 
 bot.onText(/\/wallets/, (msg) => {
-  const walletsText = `
-🔍 *Tracked Wallets*
+  const walletsMessage = `
+🔍 *Tracked Wallets* 🔍
 
 ${CONFIG.trackedWallets
-  .map(
-    (wallet, index) =>
-      `${index + 1}. \`${wallet.slice(0, 6)}...${wallet.slice(-4)}\``
-  )
+  .map((wallet, index) => `${index + 1}. \`${wallet}\``)
   .join("\n")}
-`;
-  bot.sendMessage(msg.chat.id, walletsText, { parse_mode: "Markdown" });
+  `;
+
+  bot.sendMessage(msg.chat.id, walletsMessage, { parse_mode: "Markdown" });
 });
 
-// Start the alert sending process
-solanaTracker.sendWalletAlerts();
-console.log("🚀 Solana Whale Tracker Bot is running...");
+// Start the token tracker
+tokenTracker.start();
+
+console.log("🤖 Telegram Bot is running...");
